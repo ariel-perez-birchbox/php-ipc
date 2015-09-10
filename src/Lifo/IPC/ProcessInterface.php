@@ -8,7 +8,6 @@
  * file that was distributed with this source code.
  */
 namespace Lifo\IPC;
-
 /**
  * Interface representing an activity that will be run in a separate forked
  * process.
@@ -16,7 +15,7 @@ namespace Lifo\IPC;
 interface ProcessInterface
 {
     /**
-     * Method representing the process’s activity which is run in its own
+     * Method representing the processâ€™s activity which is run in its own
      * child process.
      */
     public function run($parent);

@@ -4,11 +4,28 @@
  *
  * (c) Jason Morriss <lifo2013@gmail.com>
  *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
+ * Copyright (c) 2013 Jason Morriss
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is furnished
+ * to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
  */
-namespace Lifo\IPC;
 
+namespace Lifo\IPC;
 declare(ticks = 1);
 
 /**
@@ -26,80 +43,70 @@ declare(ticks = 1);
  * previous ProcessPool will not reap its children properly.
  *
  * @example
-    $pool = new ProcessPool(16);
-    for ($i=0; $i<100; $i++) {
-        $pool->apply(function($parent) use ($i) {
-            echo "$i running...\n";
-            mt_srand(); // must re-seed for each child
-            $rand = mt_rand(1000000, 2000000);
-            usleep($rand);
-            return $i . ' : slept for ' . ($rand / 1000000) . ' seconds';
-        });
-    }
-    while ($pool->getPending()) {
-        try {
-            $result = $pool->get(1);    // timeout in 1 second
-            echo "GOT: ", $result, "\n";
-        } catch (ProcessPoolException $e) {
-            // timeout
-        }
-    }
+$pool = new ProcessPool(16);
+ * for ($i=0; $i<100; $i++) {
+ * $pool->apply(function($parent) use ($i) {
+ * echo "$i running...\n";
+ * mt_srand(); // must re-seed for each child
+ * $rand = mt_rand(1000000, 2000000);
+ * usleep($rand);
+ * return $i . ' : slept for ' . ($rand / 1000000) . ' seconds';
+ * });
+ * }
+ * while ($pool->getPending()) {
+ * try {
+ * $result = $pool->get(1);    // timeout in 1 second
+ * echo "GOT: ", $result, "\n";
+ * } catch (ProcessPoolException $e) {
+ * // timeout
+ * }
+ * }
  *
  */
 class ProcessPool
 {
     /** @var Integer Maximum workers allowed at once */
     protected $max;
-
-    /** @var boolean If true workers will fork. Otherwise they will run synchronously */
-    protected $fork;
-
     /** @var Integer Total results collected */
     protected $count;
-
     /** @var array Pending processes that have not been started yet */
     protected $pending;
-
     /** @var array Processes that have been started */
     protected $workers;
-
     /** @var array Results that have been collected */
     protected $results;
-
     /** @var \Closure Function to call every time a child is forked */
     protected $createCallback;
-
     /** @var array children PID's that died prematurely */
-    private   $caught;
-
+    private $caught;
     /** @var boolean Is the signal handler initialized? */
-    private   $initialized;
+    private $initialized;
+    /** @var string path to calling script */
+    private $callerPath = '/tmp';
+    /** @var resource message queue */
+    private $messageQueue;
+    /** @var integer queue max byte capacity */
+    private $queueMaxBytes = 0;
+    /** @var integer size of average message in bytes */
+    private $averageMessageSize = 2048;
 
-    private static $instance = array();
-
-    public function __construct($max = 1, $fork = true)
+    public function __construct($max = 1, $callerPath = '/tmp')
     {
-        //$pid = getmypid();
-        //if (isset(self::$instance[$pid])) {
-        //    $caller = debug_backtrace();
-        //    throw new ProcessPoolException("Cannot instantiate more than 1 ProcessPool in the same process in {$caller[0]['file']} line {$caller[0]['line']}");
-        //}
-        //self::$instance[$pid] = $this;
         $this->count = 0;
         $this->max = $max;
-        $this->fork = $fork;
         $this->results = array();
         $this->workers = array();
         $this->pending = array();
         $this->caught = array();
         $this->initialized = false;
+        $this->callerPath = $callerPath;
+        msg_remove_queue(msg_get_queue($this->generateQueueId()));
     }
 
     public function __destruct()
     {
         // make sure signal handler is removed
         $this->uninit();
-        //unset(self::$instance[getmygid()]);
     }
 
     /**
@@ -114,8 +121,18 @@ class ProcessPool
         if ($this->initialized and !$force) {
             return;
         }
+
+        $this->messageQueue = msg_get_queue($this->generateQueueId());
         $this->initialized = true;
         pcntl_signal(SIGCHLD, array($this, 'signalHandler'));
+    }
+
+    private function generateQueueId()
+    {
+        // For some reason this number has to be lower than 256KB
+        // otherwise, the queue can't be created.
+        // Don't know the exact limit, but 128KB works
+        return ftok($this->callerPath, "A") % 131072;
     }
 
     private function uninit()
@@ -124,6 +141,7 @@ class ProcessPool
             return;
         }
         $this->initialized = false;
+
         pcntl_signal(SIGCHLD, SIG_DFL);
     }
 
@@ -144,11 +162,8 @@ class ProcessPool
         if ($pid === null) {
             $pid = pcntl_waitpid(-1, $status, WNOHANG);
         }
-
         while ($pid > 0) {
             if (isset($this->workers[$pid])) {
-                // @todo does the socket really need to be closed?
-                //@socket_close($this->workers[$pid]['socket']);
                 unset($this->workers[$pid]);
             } else {
                 // the child died before the parent could initialize the $worker
@@ -164,35 +179,42 @@ class ProcessPool
      * Wait for any child to be ready
      *
      * @param integer $timeout Timeout to wait (fractional seconds)
-     * @return array|null Returns array of sockets ready to be READ or null
+     * @return integer|null Returns number of results available for reading
      */
     public function wait($timeout = null)
     {
-        $x = null;                      // trash var needed for socket_select
         $startTime = microtime(true);
         while (true) {
             $this->apply();                         // maintain worker queue
-
-            // check each child socket pair for a new result
-            $read = array_map(function($w){ return $w['socket']; }, $this->workers);
-            // it's possible for no workers/sockets to be present due to REAPING
-            if (!empty($read)) {
-                $ok = @socket_select($read, $x, $x, $timeout);
-                if ($ok !== false and $ok > 0) {
-                    return $read;
-                }
+            $msgCount = $this->getQueueDepth();
+            if ($msgCount) {
+                return $msgCount;
             }
-
             // timed out?
             if ($timeout and microtime(true) - $startTime > $timeout) {
                 return null;
             }
-
             // no sense in waiting if we have no workers and no more pending
             if (empty($this->workers) and empty($this->pending)) {
                 return null;
             }
         }
+    }
+
+    /**
+     * Process all results in the message queue
+     *
+     * @return boolean| Returns whether or not it processed anything
+     */
+    public function processResults()
+    {
+        $processed = false;
+        while ($res = $this->popMessage()) {
+            $this->results[] = $res;
+            $this->count++;
+            $processed = true;
+        }
+        return $processed;
     }
 
     /**
@@ -212,22 +234,13 @@ class ProcessPool
             if ($this->hasResult()) {
                 return $this->getResult();
             }
-
             // wait for the next result
-            $ready = $this->wait($timeout);
-            if (is_array($ready)) {
-                foreach ($ready as $socket) {
-                    $res = self::socket_fetch($socket);
-                    if ($res !== null) {
-                        $this->results[] = $res;
-                        $this->count++;
-                    }
-                }
-                if ($this->hasResult()) {
-                    return $this->getResult();
-                }
+            if ($this->wait($timeout)) {
+                $this->processResults();
             }
-
+            if ($this->hasResult()) {
+                return $this->getResult();
+            }
             // timed out?
             if ($timeout and microtime(true) - $startTime > $timeout) {
                 if ($nullOnTimeout) {
@@ -248,7 +261,7 @@ class ProcessPool
      * @return array Returns an array of results
      * @throws ProcessPoolException On timeout if $nullOnTimeout is false
      */
-    public function getAll($timeout = null, $nullOnTimeout = false)
+    public function getAll($timeout = null, $resultsOnTimeout = false)
     {
         $results = array();
         $startTime = microtime(true);
@@ -259,13 +272,13 @@ class ProcessPool
                     $results[] = $res;
                 }
             } catch (ProcessPoolException $e) {
-                // timed out
+                //Timed Out
             }
 
             // timed out?
             if ($timeout and microtime(true) - $startTime > $timeout) {
-                if ($nullOnTimeout) {
-                    return null;
+                if ($resultsOnTimeout) {
+                    return $results;
                 }
                 throw new ProcessPoolException("Timeout");
             }
@@ -307,19 +320,16 @@ class ProcessPool
                 throw new \UnexpectedValueException("Parameter 1 in ProcessPool#apply must be a Closure or callable");
             }
         }
-
-        // start a new worker if our current worker queue is low
-        if (!empty($this->pending) and count($this->workers) < $this->max) {
+        // start new workers if our current worker queue is low
+        while (!empty($this->pending) and count($this->workers) < $this->max) {
             call_user_func_array(array($this, 'create'), array_shift($this->pending));
         }
-
         return $this;
     }
 
     /**
      * Create a new worker.
      *
-     * If forking is disabled this will BLOCK.
      *
      * @param Closure $func Callback function.
      * @param mixed Any extra parameters are passed to the callback function.
@@ -327,63 +337,34 @@ class ProcessPool
      */
     protected function create($func /*, ...*/)
     {
-        // create a socket pair before forking so our child process can write to the PARENT.
-        $sockets = array();
-        $domain = strtoupper(substr(PHP_OS, 0, 3)) == 'WIN' ? AF_INET : AF_UNIX;
-        if (socket_create_pair($domain, SOCK_STREAM, 0, $sockets) === false) {
-            throw new \RuntimeException("socket_create_pair failed: " . socket_strerror(socket_last_error()));
-        }
-        list($child, $parent) = $sockets; // just to make the code below more readable
-        unset($sockets);
-
-        $args = array_merge(array($parent), array_slice(func_get_args(), 1));
-
+        $args = array_slice(func_get_args(), 1);
         $this->init();                  // make sure signal handler is installed
 
-        if ($this->fork) {
-            $pid = pcntl_fork();
-            if ($pid == -1) {
-                throw new \RuntimeException("Could not fork");
+        $pid = pcntl_fork();
+        if ($pid == -1) {
+            throw new \RuntimeException("Could not fork");
+        }
+        if ($pid > 0) {
+            // PARENT PROCESS; Just track the child and return
+            $this->workers[$pid] = $pid;
+            $this->doOnCreate($args, 1);
+            // If a SIGCHLD was already caught at this point we need to
+            // manually handle it to avoid a defunct process.
+            if (isset($this->caught[$pid])) {
+                $this->reaper($pid, $this->caught[$pid]);
+                unset($this->caught[$pid]);
             }
 
-            if ($pid > 0) {
-                // PARENT PROCESS; Just track the child and return
-                socket_close($parent);
-                $this->workers[$pid] = array(
-                    'pid' => $pid,
-                    'socket' => $child,
-                );
-                // don't pass $parent to callback
-                $this->doOnCreate(array_slice($args, 1));
+            // Process results if the queue exceeds approximately 80% capacity.
+            $msgCount = $this->getQueueDepth();
+            $queueMaxBytes = $this->getQueueMaxBytes();
+            $avgMessageSize = $this->getAverageMessageSize();
 
-                // If a SIGCHLD was already caught at this point we need to
-                // manually handle it to avoid a defunct process.
-                if (isset($this->caught[$pid])) {
-                    $this->reaper($pid, $this->caught[$pid]);
-                    unset($this->caught[$pid]);
-                }
-            } else {
-                // CHILD PROCESS; execute the callback function and wait for response
-                socket_close($child);
-                try {
-                    if ($func instanceof ProcessInterface) {
-                        $result = call_user_func_array(array($func, 'run'), $args);
-                    } else {
-                        $result = call_user_func_array($func, $args);
-                    }
-                    if ($result !== null) {
-                        self::socket_send($parent, $result);
-                    }
-                } catch (\Exception $e) {
-                    // this is kind of useless in a forking context but at
-                    // least the developer can see the exception if it occurs.
-                    throw $e;
-                }
-                exit(0);
+            if ($msgCount * $avgMessageSize >= $queueMaxBytes * 0.8) {
+                $this->processResults();
             }
         } else {
-            // forking is disabled so we simply run the child worker and wait
-            // synchronously for response.
+            // CHILD PROCESS; execute the callback function and wait for response
             try {
                 if ($func instanceof ProcessInterface) {
                     $result = call_user_func_array(array($func, 'run'), $args);
@@ -391,29 +372,16 @@ class ProcessPool
                     $result = call_user_func_array($func, $args);
                 }
                 if ($result !== null) {
-                    //$this->results[] = $result;
-                    self::socket_send($parent, $result);
+                    $this->pushMessage($result);
                 }
-
-                // read anything pending from the worker if they chose to write
-                // to the socket instead of just returning a value.
-                $x = null;
-                do {
-                    $read = array($child);
-                    $ok = socket_select($read, $x, $x, 0);
-                    if ($ok !== false and $ok > 0) {
-                        $res = self::socket_fetch($read[0]);
-                        if ($res !== null) {
-                            $this->results[] = $res;
-                        }
-                    }
-                } while ($ok);
-
             } catch (\Exception $e) {
-                // nop; we didn't fork so let the caller handle it
+                // this is kind of useless in a forking context but at
+                // least the developer can see the exception if it occurs.
                 throw $e;
             }
+            exit(0);
         }
+
     }
 
     /**
@@ -439,8 +407,8 @@ class ProcessPool
      */
     public function killAll($signo = SIGTERM)
     {
-        foreach ($this->workers as $w) {
-            $this->kill($w['pid'], $signo);
+        foreach ($this->workers as $pid) {
+            $this->kill($pid, $signo);
         }
         return $this;
     }
@@ -492,12 +460,6 @@ class ProcessPool
         return $this->count;
     }
 
-    public function setForking($fork)
-    {
-        $this->fork = $fork;
-        return $this;
-    }
-
     public function setMax($max)
     {
         if (!is_numeric($max) or $max < 1) {
@@ -513,60 +475,72 @@ class ProcessPool
     }
 
     /**
-     * Write the data to the socket in a predetermined format
+     * Write the data to the message queue.
      */
-    public static function socket_send($socket, $data)
+    public function pushMessage($data)
     {
-        $serialized = serialize($data);
-        $hdr = pack('N', strlen($serialized));    // 4 byte length
-        $buffer = $hdr . $serialized;
-        $total = strlen($buffer);
-        while (true) {
-            $sent = socket_write($socket, $buffer);
-            if ($sent === false) {
-                // @todo handle error?
-                //$error = socket_strerror(socket_last_error());
-                break;
-            }
-            if ($sent >= $total) {
-                break;
-            }
-            $total -= $sent;
-            $buffer = substr($buffer, $sent);
-        }
+        msg_send($this->messageQueue, 1, $data, true, false);
     }
 
     /**
-     * Read a data packet from the socket in a predetermined format.
+     * Read a data packet from the message queue.
      *
      * Blocking.
      *
      */
-    public static function socket_fetch($socket)
+    public function popMessage()
     {
-        // read 4 byte length first
-        $hdr = '';
-        do {
-            $read = socket_read($socket, 4 - strlen($hdr));
-            if ($read === false or $read === '') {
-                return null;
-            }
-            $hdr .= $read;
-        } while (strlen($hdr) < 4);
+        $msgType = null;
+        $data = null;
+        $errorCode = null;
 
-        list($len) = array_values(unpack("N", $hdr));
+        //TODO: Handle Error Codes
+        msg_receive($this->messageQueue, 1, $msgType, 4096, $data, true, MSG_NOERROR, $errorCode);
+        $this->updateAverageMessageSize($data);
 
-        // read the full buffer
-        $buffer = '';
-        do {
-            $read = socket_read($socket, $len - strlen($buffer));
-            if ($read === false or $read == '') {
-                return null;
-            }
-            $buffer .= $read;
-        } while (strlen($buffer) < $len);
-
-        $data = unserialize($buffer);
         return $data;
+    }
+
+    /**
+     * Return number of messages in queue
+     */
+    public function getQueueDepth()
+    {
+        $stats = msg_stat_queue($this->messageQueue);
+        return $stats['msg_qnum'];
+    }
+
+    /**
+     * Return queue max capacity in bytes
+     *
+     */
+    public function getQueueMaxBytes()
+    {
+        if ($this->queueMaxBytes == 0) {
+            $stats = msg_stat_queue($this->messageQueue);
+            $this->queueMaxBytes = $stats['msg_qbytes'];
+        }
+        return $this->queueMaxBytes;
+    }
+
+    /**
+     * Return average message size, in bytes
+     *
+     */
+    public function getAverageMessageSize()
+    {
+        return $this->averageMessageSize;
+    }
+
+    /**
+     * Updates average message size
+     *
+     */
+    public function updateAverageMessageSize($message)
+    {
+        $size = strlen(serialize($message));
+        $totalBytesReceived = ($this->count * $this->averageMessageSize) + $size;
+
+        $this->averageMessageSize = ceil($totalBytesReceived / ($this->count + 1.0));
     }
 }

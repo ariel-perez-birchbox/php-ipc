@@ -8,8 +8,6 @@
  * file that was distributed with this source code.
  */
 namespace Lifo\IPC;
-
 class ProcessPoolException extends \Exception
 {
-
 }
