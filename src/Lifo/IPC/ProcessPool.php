@@ -23,6 +23,8 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
+ *
+ * See: https://github.com/ariel-perez-birchbox/php-ipc
  */
 
 namespace Lifo\IPC;
@@ -67,6 +69,8 @@ class ProcessPool
 {
     /** @var Integer Maximum workers allowed at once */
     protected $max;
+    /** @var Integer Total jobs submitted */
+    protected $submitted;
     /** @var Integer Total results collected */
     protected $count;
     /** @var array Pending processes that have not been started yet */
@@ -92,6 +96,7 @@ class ProcessPool
 
     public function __construct($max = 1, $callerPath = '/tmp')
     {
+        $this->submitted = 0;
         $this->count = 0;
         $this->max = $max;
         $this->results = array();
@@ -101,6 +106,7 @@ class ProcessPool
         $this->initialized = false;
         $this->callerPath = $callerPath;
         msg_remove_queue(msg_get_queue($this->generateQueueId()));
+        $this->messageQueue = msg_get_queue($this->generateQueueId());
     }
 
     public function __destruct()
@@ -122,8 +128,8 @@ class ProcessPool
             return;
         }
 
-        $this->messageQueue = msg_get_queue($this->generateQueueId());
         $this->initialized = true;
+
         pcntl_signal(SIGCHLD, array($this, 'signalHandler'));
     }
 
@@ -141,7 +147,6 @@ class ProcessPool
             return;
         }
         $this->initialized = false;
-
         pcntl_signal(SIGCHLD, SIG_DFL);
     }
 
@@ -190,12 +195,13 @@ class ProcessPool
             if ($msgCount) {
                 return $msgCount;
             }
+
             // timed out?
             if ($timeout and microtime(true) - $startTime > $timeout) {
                 return null;
             }
             // no sense in waiting if we have no workers and no more pending
-            if (empty($this->workers) and empty($this->pending)) {
+            if (empty($this->workers) && empty($this->pending)) {
                 return null;
             }
         }
@@ -204,9 +210,9 @@ class ProcessPool
     /**
      * Process all results in the message queue
      *
-     * @return boolean| Returns whether or not it processed anything
+     * @return boolean Returns whether or not it processed any messages
      */
-    public function processResults()
+    public function loadResults()
     {
         $processed = false;
         while ($res = $this->popMessage()) {
@@ -236,7 +242,7 @@ class ProcessPool
             }
             // wait for the next result
             if ($this->wait($timeout)) {
-                $this->processResults();
+                $this->loadResults();
             }
             if ($this->hasResult()) {
                 return $this->getResult();
@@ -314,16 +320,22 @@ class ProcessPool
     {
         // add new function to pending queue
         if ($func !== null) {
+            $this->submitted++;
             if ($func instanceof \Closure or $func instanceof ProcessInterface or is_callable($func)) {
                 $this->pending[] = func_get_args();
             } else {
                 throw new \UnexpectedValueException("Parameter 1 in ProcessPool#apply must be a Closure or callable");
             }
         }
-        // start new workers if our current worker queue is low
+
+        $this->maintainQueueCapacity();
+
+        // start as many workers as needed up to the max to process the pending queue
         while (!empty($this->pending) and count($this->workers) < $this->max) {
             call_user_func_array(array($this, 'create'), array_shift($this->pending));
+            $this->maintainQueueCapacity();
         }
+
         return $this;
     }
 
@@ -355,14 +367,7 @@ class ProcessPool
                 unset($this->caught[$pid]);
             }
 
-            // Process results if the queue exceeds approximately 80% capacity.
-            $msgCount = $this->getQueueDepth();
-            $queueMaxBytes = $this->getQueueMaxBytes();
-            $avgMessageSize = $this->getAverageMessageSize();
 
-            if ($msgCount * $avgMessageSize >= $queueMaxBytes * 0.8) {
-                $this->processResults();
-            }
         } else {
             // CHILD PROCESS; execute the callback function and wait for response
             try {
@@ -435,6 +440,14 @@ class ProcessPool
     }
 
     /**
+     * Return the total jobs that have been submitted.
+     */
+    public function getSubmitted()
+    {
+        return $this->submitted;
+    }
+
+    /**
      * Return the total jobs that have NOT completed yet.
      */
     public function getPending($pendingOnly = false)
@@ -442,7 +455,7 @@ class ProcessPool
         if ($pendingOnly) {
             return count($this->pending);
         }
-        return count($this->pending) + count($this->workers) + count($this->results);
+        return $this->getSubmitted() - $this->getCompleted() + count($this->results) + $this->getQueueDepth();
     }
 
     public function getWorkers()
@@ -476,17 +489,21 @@ class ProcessPool
 
     /**
      * Write the data to the message queue.
+     *
+     * Retry in every second if the queue is full
      */
     public function pushMessage($data)
     {
-        msg_send($this->messageQueue, 1, $data, true, false);
+        $errorCode = null;
+        do {
+            $sent = msg_send($this->messageQueue, 1, $data, true, false, $errorCode);
+            // Retry every second if the queue is full
+        } while (!$sent && $errorCode === MSG_EAGAIN && sleep(1) === 0);
+
     }
 
     /**
      * Read a data packet from the message queue.
-     *
-     * Blocking.
-     *
      */
     public function popMessage()
     {
@@ -495,10 +512,26 @@ class ProcessPool
         $errorCode = null;
 
         //TODO: Handle Error Codes
-        msg_receive($this->messageQueue, 1, $msgType, 4096, $data, true, MSG_NOERROR, $errorCode);
+        // Note max message size is 4KB
+        msg_receive($this->messageQueue, 1, $msgType, 4096, $data, true, 0, $errorCode);
         $this->updateAverageMessageSize($data);
 
         return $data;
+    }
+
+    /**
+     * Process results if the queue exceeds approximately 75% capacity.
+     */
+
+    public function maintainQueueCapacity() {
+        $msgCount = $this->getQueueDepth();
+        $queueMaxBytes = $this->getQueueMaxBytes();
+        $avgMessageSize = $this->getAverageMessageSize();
+
+        if ($msgCount * $avgMessageSize >= $queueMaxBytes * 0.75) {
+            return $this->loadResults();
+        }
+        return false;
     }
 
     /**
@@ -512,7 +545,6 @@ class ProcessPool
 
     /**
      * Return queue max capacity in bytes
-     *
      */
     public function getQueueMaxBytes()
     {
