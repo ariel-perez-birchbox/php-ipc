@@ -22,16 +22,8 @@ $pool = new ProcessPool(16);
 
 // apply 100 processes to the pool.
 for ($i=0; $i<100; $i++) {
-    $pool->apply(function($parent) use ($i) {
-        // Each child can write to the $parent socket to send more than a single
-        // result. Make sure you use ProcessPool::socket_send()
-        ProcessPool::socket_send($parent, "$i says the time is " . time());
-
-        // Results can be any serializable value
-        ProcessPool::socket_send($parent, array('date' => date('Y-m-d'), 'time' => time()));
-
-        // Each child can optionally return a result or just use socket_send
-        // as shown above.
+    $pool->apply(function() use ($i) {
+        // Each child can optionally return a result
         mt_srand(); // must re-seed for each child
         $rand = mt_rand(1000000, 2000000);
         usleep($rand);
@@ -71,7 +63,7 @@ $pool->setOnCreate(function() use (&$db) {
 });
 
 // create a child
-$pool->apply(function($parent) use (&$db) {
+$pool->apply(function() use (&$db) {
     // do stuff in the child; When we exit the $db handle will
     // close but won't affect the parent since it reconnected
     // after we were created (our $db handle is not equal to the parent $db)
