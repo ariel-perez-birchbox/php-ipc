@@ -513,8 +513,10 @@ class ProcessPool
 
         //TODO: Handle Error Codes
         // Note max message size is 4KB
-        msg_receive($this->messageQueue, 1, $msgType, 4096, $data, true, 0, $errorCode);
-        $this->updateAverageMessageSize($data);
+        msg_receive($this->messageQueue, 1, $msgType, 4096, $data, true, MSG_IPC_NOWAIT, $errorCode);
+        if ($data) {
+            $this->updateAverageMessageSize($data);
+        }
 
         return $data;
     }
